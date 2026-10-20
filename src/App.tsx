@@ -2,6 +2,7 @@ import { useEffect, useState, type ComponentType } from 'react';
 import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { Analysis } from './pages/Analysis';
+import { PlayCoach } from './pages/PlayCoach';
 import { Training } from './pages/Training';
 import { Plan } from './pages/Plan';
 import { Progress } from './pages/Progress';
@@ -11,6 +12,7 @@ import { Settings } from './pages/Settings';
 const ROUTES: Record<string, ComponentType> = {
   dashboard: Dashboard,
   analysis: Analysis,
+  playcoach: PlayCoach,
   training: Training,
   plan: Plan,
   progress: Progress,

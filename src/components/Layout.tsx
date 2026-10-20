@@ -1,11 +1,12 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import {
-  LayoutDashboard, Search, Dumbbell, CalendarCheck, TrendingUp, BookOpen, Settings, WifiOff
+  LayoutDashboard, Search, Swords, Dumbbell, CalendarCheck, TrendingUp, BookOpen, Settings, WifiOff
 } from 'lucide-react';
 
 const NAV = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'analysis', label: 'Analysis', icon: Search },
+  { id: 'playcoach', label: 'Play coach', icon: Swords },
   { id: 'training', label: 'Training', icon: Dumbbell },
   { id: 'plan', label: 'Plan', icon: CalendarCheck },
   { id: 'progress', label: 'Progress', icon: TrendingUp },
@@ -42,7 +43,7 @@ export function Layout({ route, children }: { route: string; children: ReactNode
         </nav>
         {!online && (
           <div className="mx-3 mb-3 flex items-center gap-2 text-xs text-amber-300/90 bg-amber-400/10 rounded-lg px-2 py-1.5">
-            <WifiOff size={14} /> Offline — cached data only
+            <WifiOff size={14} /> Offline - cached data only
           </div>
         )}
       </aside>
