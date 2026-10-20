@@ -3,7 +3,7 @@ export function EvalBar({ cp, mate }: { cp: number | null; mate: number | null }
   if (mate !== null) whitePct = mate > 0 ? 100 : 0;
   else if (cp !== null) {
     const clamped = Math.max(-800, Math.min(800, cp));
-    whitePct = 50 + (clamped / 800) * 50;
+    whitePct = 50 - (clamped / 800) * 50;
   }
 
   const label = mate !== null ? `M${Math.abs(mate)}` : cp !== null ? (cp / 100).toFixed(2) : '—';
