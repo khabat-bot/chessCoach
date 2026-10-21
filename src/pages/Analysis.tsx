@@ -1,16 +1,30 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import { Chessboard } from 'react-chessboard';
 import { Chess } from 'chess.js';
-import { ChevronFirst, ChevronLeft, ChevronRight, ChevronLast, Play, Square, Upload } from 'lucide-react';
+import {
+  ChevronFirst, ChevronLeft, ChevronRight, ChevronLast, Play, Square, Upload,
+  FolderOpen, X
+} from 'lucide-react';
 import { parsePgn, isValidFen, fenAtPly, PgnError } from '../lib/pgn';
 import { getEngine } from '../engine/stockfish';
 import { useEngine } from '../hooks/useEngine';
-import { useLoadGameFromHash } from '../hooks/useLoadGameFromHash';
 import { runAnalysis } from '../features-runner';
-import { saveGame, saveAnalysis, addTrainingItem, makeTrainingItem, getAnalysis, getPrefs } from '../storage/db';
+import {
+  saveGame, saveAnalysis, addTrainingItem, makeTrainingItem, getAnalysis, getPrefs, listGames
+} from '../storage/db';
 import { openingFor } from '../lib/openings';
 import { EvalBar } from '../components/EvalBar';
 import type { GameRecord, MoveEval } from '../types';
+
+function extractGameId(): string | null {
+  const m = window.location.hash.match(/[?&]gameId=([^&]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+function gameResult(g: GameRecord): string {
+  const m = g.pgn?.match(/\[Result "([^"]+)"\]/);
+  return m ? m[1] : '?';
+}
 
 export function Analysis() {
   const { status, error } = useEngine();
@@ -26,25 +40,73 @@ export function Analysis() {
   const abortRef = useRef<AbortController | null>(null);
   const partialRef = useRef<MoveEval[]>([]);
 
-  // Load a specific game if the URL hash has ?gameId= (from PlayCoach).
-  // Bypasses parsePgn/importPgn so we keep the existing record id.
-  useLoadGameFromHash((g) => {
-    setPgnText(g.pgn);
-    setGame(g);
-    setPly(0);
-    setPartial([]);
-    partialRef.current = [];
-    setMsg(`Loaded game (${g.plies} half-moves).`);
+  // ─── hash-driven game loader ─────────────────────────────────
+  const [hashGameId, setHashGameId] = useState<string | null>(() => extractGameId());
+  const [allGames, setAllGames] = useState<GameRecord[]>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [gamesCount, setGamesCount] = useState(0);
+
+  useEffect(() => {
+    const onHash = () => setHashGameId(extractGameId());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  useEffect(() => {
+    if (!hashGameId) return;
+    if (game?.id === hashGameId) return;
+    let cancelled = false;
     void (async () => {
       try {
+        const all = await listGames();
+        const g = all.find((x) => x.id === hashGameId);
+        if (cancelled) return;
+        if (!g) { setMsg('Game not found.'); return; }
+        setGame(g);
+        setPgnText(g.pgn);
+        setPly(0);
+        setPartial([]);
+        partialRef.current = [];
+        setMsg(`Loaded game (${g.plies} half-moves).`);
         const existing = await getAnalysis(g.id);
+        if (cancelled) return;
         if (existing) {
           setPartial(existing.moves);
           partialRef.current = existing.moves;
         }
+      } catch {
+        if (!cancelled) setMsg('Failed to load game.');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [hashGameId, game?.id]);
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const games = await listGames();
+        games.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+        if (!cancelled) {
+          setAllGames(games);
+          setGamesCount(games.length);
+        }
       } catch { /* ignore */ }
     })();
-  });
+    return () => { cancelled = true; };
+  }, [pickerOpen]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const games = await listGames();
+        setGamesCount(games.length);
+      } catch { /* ignore */ }
+    })();
+  }, [game?.id]);
+
+  // ─── (rest unchanged from here on) ───────────────────────────
 
   useEffect(() => {
     const m = partial.find((x) => x.ply === ply);
@@ -79,16 +141,9 @@ export function Analysis() {
     setMsg(null);
     try {
       const parsed = parsePgn(text);
-      setGame(parsed);
-      setPly(0);
-      setPartial([]);
       await saveGame(parsed);
-      const existing = await getAnalysis(parsed.id);
-      if (existing) {
-        setPartial(existing.moves);
-        partialRef.current = existing.moves;
-      }
       setMsg(`Imported ${parsed.plies} half-moves.`);
+      window.location.hash = `#analysis?gameId=${encodeURIComponent(parsed.id)}`;
     } catch (e) {
       setMsg(e instanceof PgnError ? e.message : 'Could not import PGN.');
     }
@@ -226,6 +281,53 @@ export function Analysis() {
         </div>
 
         <div className="space-y-3 min-w-0">
+          {/* ─── Game picker ─────────────────────────────────── */}
+          <div className="rounded-xl border border-ink-600 bg-ink-800">
+            <button
+              type="button"
+              onClick={() => setPickerOpen((o) => !o)}
+              className="w-full p-3 flex items-center justify-between text-sm">
+              <span className="flex items-center gap-2 text-slate-300">
+                <FolderOpen size={14} />
+                Your games
+                <span className="text-xs text-slate-500">({gamesCount})</span>
+              </span>
+              {pickerOpen ? <X size={14} /> : <span className="text-xs text-slate-500">open ▾</span>}
+            </button>
+            {pickerOpen && (
+              <div className="border-t border-ink-600 max-h-72 overflow-y-auto">
+                {allGames.length === 0 ? (
+                  <p className="text-xs text-slate-500 p-3">No saved games yet — play a coach game or import a PGN.</p>
+                ) : (
+                  <ul className="divide-y divide-ink-700">
+                    {allGames.map((g) => (
+                      <li key={g.id}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPickerOpen(false);
+                            window.location.hash = `#analysis?gameId=${encodeURIComponent(g.id)}`;
+                          }}
+                          className={`w-full text-left px-3 py-2 text-xs hover:bg-ink-700 ${
+                            game?.id === g.id ? 'bg-lime/10 text-lime' : 'text-slate-300'
+                          }`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <span>
+                              {g.createdAt ? new Date(g.createdAt).toLocaleDateString() : '—'}
+                              {' · '}{g.plies} plies
+                            </span>
+                            <span className="font-mono">{gameResult(g)}</span>
+                          </div>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ─── Analysis controls ───────────────────────────── */}
           <div className="rounded-xl border border-ink-600 bg-ink-800 p-3">
             <div className="flex flex-wrap gap-2">
               <button
@@ -257,6 +359,7 @@ export function Analysis() {
             {msg && <p className="text-xs text-slate-400 mt-2">{msg}</p>}
           </div>
 
+          {/* ─── PGN import ──────────────────────────────────── */}
           <div className="rounded-xl border border-ink-600 bg-ink-800 p-3 space-y-2">
             <label className="text-xs uppercase tracking-wide text-slate-500">Import PGN</label>
             <textarea
