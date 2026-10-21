@@ -4,6 +4,14 @@ import { listGames, allAnalyses, allTrainingItems } from '../storage/db';
 import { accuracyFromAcpl } from '../lib/eval';
 import type { GameRecord, GameAnalysis, TrainingItem } from '../types';
 
+function headerField(pgn: string | undefined, name: string): string | null {
+  if (!pgn) return null;
+  const m = pgn.match(new RegExp(`\\[${name} "([^"]*)"\\]`));
+  if (!m) return null;
+  const v = m[1].trim();
+  return v && v !== '?' ? v : null;
+}
+
 export function Dashboard() {
   const [games, setGames] = useState<GameRecord[]>([]);
   const [analyses, setAnalyses] = useState<GameAnalysis[]>([]);
@@ -41,6 +49,11 @@ export function Dashboard() {
       const a2 = losses.length ? losses.reduce((x, y) => x + y, 0) / losses.length : 0;
       return { name: `#${i + 1}`, accuracy: Number(accuracyFromAcpl(a2).toFixed(1)) };
     });
+
+  const recent = games
+    .slice()
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+    .slice(0, 6);
 
   const empty = games.length === 0;
 
@@ -102,23 +115,44 @@ export function Dashboard() {
       </div>
 
       <section className="rounded-xl border border-ink-600 bg-ink-800 p-4">
-        <h2 className="font-medium mb-3">Recent games</h2>
-        {games.length === 0 ? (
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-medium">Recent games</h2>
+          <a href="#analysis" className="text-xs text-slate-400 hover:text-lime">
+            see all →
+          </a>
+        </div>
+        {recent.length === 0 ? (
           <p className="text-sm text-slate-500">Nothing here yet.</p>
         ) : (
           <ul className="divide-y divide-ink-600">
-            {games.slice(0, 6).map((g) => (
-              <li key={g.id} className="py-2 flex items-center justify-between gap-4 text-sm">
-                <span className="truncate">
-                  {g.white ?? 'White'} vs {g.black ?? 'Black'}
-                  {g.result ? ` · ${g.result}` : ''}
-                </span>
-                <span className={`shrink-0 text-xs px-2 py-0.5 rounded-full ${
-                  g.status === 'complete' ? 'bg-lime/10 text-lime' : 'bg-ink-700 text-slate-400'}`}>
-                  {g.status}
-                </span>
-              </li>
-            ))}
+            {recent.map((g) => {
+              const white = g.white ?? headerField(g.pgn, 'White') ?? 'White';
+              const black = g.black ?? headerField(g.pgn, 'Black') ?? 'Black';
+              const result = g.result ?? headerField(g.pgn, 'Result') ?? '';
+              const date = g.createdAt
+                ? new Date(g.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+                : '';
+              return (
+                <li key={g.id}>
+                  <a
+                    href={`#analysis?gameId=${encodeURIComponent(g.id)}`}
+                    className="py-2 flex items-center justify-between gap-4 text-sm -mx-2 px-2 rounded hover:bg-ink-700/50 transition-colors">
+                    <span className="truncate">
+                      {white} vs {black}
+                      {result ? ` · ${result}` : ''}
+                      {g.plies ? <span className="text-slate-500"> · {g.plies} plies</span> : null}
+                    </span>
+                    <span className="shrink-0 flex items-center gap-2">
+                      {date && <span className="text-xs text-slate-500 tabular-nums">{date}</span>}
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${
+                        g.status === 'complete' ? 'bg-lime/10 text-lime' : 'bg-ink-700 text-slate-400'}`}>
+                        {g.status}
+                      </span>
+                    </span>
+                  </a>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
