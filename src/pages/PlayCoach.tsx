@@ -4,6 +4,8 @@ import { Chess } from 'chess.js';
 import { useEngine } from '../hooks/useEngine';
 import { getEngine } from '../engine/stockfish';
 import { classify, evalLoss, toCentipawns } from '../lib/eval';
+import { parsePgn } from '../lib/pgn';
+import { saveGame } from '../storage/db';
 import type { Classification } from '../types';
 import { EvalBar } from '../components/EvalBar';
 
@@ -48,6 +50,8 @@ export function PlayCoach() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [feedback, setFeedback] = useState<CoachFeedback | null>(null);
   const [engineError, setEngineError] = useState<string | null>(null);
+  const [savedGameId, setSavedGameId] = useState<string | null>(null);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
 
   const gameRef = useRef(game);
   gameRef.current = game;
@@ -59,19 +63,89 @@ export function PlayCoach() {
   const cachedBeforeEvalRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const initCacheRef = useRef(false);
+  const savedRef = useRef(false);
 
-  // When engine becomes ready and user is White, cache the starting position eval.
   useEffect(() => {
     if (status !== 'ready' || initCacheRef.current) return;
     if (userColorRef.current !== 'w') return;
     initCacheRef.current = true;
-    (async () => {
+    void (async () => {
       try {
         const res = await engine.evaluate(gameRef.current.fen(), COACH_DEPTH);
         cachedBeforeEvalRef.current = toCentipawns(res.raw);
       } catch { /* ignore */ }
     })();
   }, [status, engine]);
+
+  // Auto-save when the game ends. Fires on every ply, cheap no-op otherwise.
+  useEffect(() => {
+    if (!savedRef.current && gameRef.current.isGameOver()) {
+      void persistGame();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turns]);
+
+  async function persistGame(): Promise<string | null> {
+  if (savedRef.current) return savedGameId;
+  if (turns.length === 0) return null;
+
+  // gameRef.current is recreated from FEN on every ply, so its pgn() only
+  // holds the LAST move. Rebuild the full game from `turns` (all SANs, in
+  // order) starting from the standard initial position.
+  const rebuilt = new Chess();
+  for (const t of turns) {
+    try {
+      rebuilt.move(t.san);
+    } catch {
+      setEngineError(`Could not replay move ${t.ply}: ${t.san}`);
+      return null;
+    }
+  }
+  if (rebuilt.history().length === 0) return null;
+
+  const plies = rebuilt.history().length;
+  const result = rebuilt.isCheckmate()
+    ? (rebuilt.turn() === 'w' ? '0-1' : '1-0')
+    : rebuilt.isDraw() ? '1/2-1/2' : '*';
+
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '.');
+  // Use chess.js's own header writer — do NOT wrap .pgn() in our own
+  // header block (that produces two [Event "?"] tags and the inner
+  // [Result "*"] wins).
+  rebuilt.header(
+    'Event', 'Coaching game',
+    'Site', 'chess-supercoach',
+    'Date', today,
+    'White', 'You',
+    'Black', 'Coach',
+    'Result', result,
+    'PlyCount', String(plies)
+  );
+
+  const pgn = rebuilt.pgn();
+  if (!pgn || !pgn.trim()) return null;
+
+  try {
+    const rec = parsePgn(pgn);
+    await saveGame(rec);
+    savedRef.current = true;
+    setSavedGameId(rec.id);
+    return rec.id;
+  } catch (e) {
+    setEngineError((e as Error).message);
+    return null;
+  }
+}
+
+async function saveAndAnalyze() {
+    setSaveMsg(null);
+    const id = savedRef.current ? savedGameId : await persistGame();
+    if (!id) {
+      setSaveMsg('Nothing to save yet — play at least one move.');
+      return;
+    }
+    window.location.hash = `#analysis?gameId=${encodeURIComponent(id)}`;
+  }
 
   async function playEngineMove(c: Chess): Promise<void> {
     setThinking('Coach is thinking...');
@@ -93,8 +167,6 @@ export function PlayCoach() {
       });
       if (!played) return;
 
-      // Cache the eval of the new position from the USER's POV.
-      // After the engine's move, side-to-move = user, so cp is already user's POV.
       setThinking('Updating evaluation...');
       const coachRes = await engine.evaluate(c2.fen(), COACH_DEPTH, ctrl.signal);
       const cp = toCentipawns(coachRes.raw);
@@ -150,7 +222,6 @@ export function PlayCoach() {
       const afterCpUserPov = afterCpOpp === null ? null : -afterCpOpp;
       const loss = evalLoss(beforeUserPov, afterCpUserPov);
 
-      // True best = pv[0]. bestmove may be weakened by playDepth, so don't use it here.
       const trueBestUci = coachRes.pv[0] ?? '';
       let bestSan: string | undefined;
       if (UCI_MOVE.test(trueBestUci)) {
@@ -197,6 +268,12 @@ export function PlayCoach() {
     return true;
   }
 
+  function resetSaved() {
+    savedRef.current = false;
+    setSavedGameId(null);
+    setSaveMsg(null);
+  }
+
   function newGame() {
     abortRef.current?.abort();
     const c = new Chess();
@@ -205,6 +282,7 @@ export function PlayCoach() {
     setFeedback(null);
     setThinking(null);
     setEngineError(null);
+    resetSaved();
     cachedBeforeEvalRef.current = null;
     initCacheRef.current = false;
 
@@ -213,7 +291,7 @@ export function PlayCoach() {
         void playEngineMove(c);
       } else {
         initCacheRef.current = true;
-        (async () => {
+        void (async () => {
           try {
             const res = await engine.evaluate(c.fen(), COACH_DEPTH);
             cachedBeforeEvalRef.current = toCentipawns(res.raw);
@@ -225,7 +303,6 @@ export function PlayCoach() {
 
   function changeColor(color: 'w' | 'b') {
     setUserColor(color);
-    // Reset with the new colour. newGame reads userColorRef, so update the ref first.
     userColorRef.current = color;
     const c = new Chess();
     setGame(c);
@@ -233,6 +310,7 @@ export function PlayCoach() {
     setFeedback(null);
     setThinking(null);
     setEngineError(null);
+    resetSaved();
     cachedBeforeEvalRef.current = null;
     initCacheRef.current = false;
 
@@ -241,7 +319,7 @@ export function PlayCoach() {
         void playEngineMove(c);
       } else {
         initCacheRef.current = true;
-        (async () => {
+        void (async () => {
           try {
             const res = await engine.evaluate(c.fen(), COACH_DEPTH);
             cachedBeforeEvalRef.current = toCentipawns(res.raw);
@@ -316,14 +394,25 @@ export function PlayCoach() {
                 ))}
               </select>
 
-              <button onClick={newGame}
-                className="ml-auto rounded-lg border border-ink-600 px-3 py-1 text-sm">
-                New game
-              </button>
+              <div className="ml-auto flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={saveAndAnalyze}
+                  className="rounded-lg bg-lime text-ink-900 font-medium px-3 py-1 text-sm">
+                  {savedGameId ? 'Saved ✓ — Analyse' : 'Save & Analyse'}
+                </button>
+                <button
+                  type="button"
+                  onClick={newGame}
+                  className="rounded-lg border border-ink-600 px-3 py-1 text-sm">
+                  New game
+                </button>
+              </div>
             </div>
+            {saveMsg && <p className="text-xs text-amber-300">{saveMsg}</p>}
             <p className="text-xs text-slate-500">
               Coaching depth is {COACH_DEPTH} for accurate feedback. Difficulty only changes how
-              strongly Stockfish plays its own moves.
+              strongly Stockfish plays its own moves. Finished games are saved automatically.
             </p>
           </div>
 
@@ -332,6 +421,10 @@ export function PlayCoach() {
               {game.isCheckmate()
                 ? `Checkmate - ${game.turn() === userColor ? 'you lose' : 'you win'}.`
                 : 'Draw.'}
+              {' '}
+              {savedGameId
+                ? 'Click "Saved ✓ — Analyse" to run a full game analysis.'
+                : 'Saving...'}
             </div>
           )}
 
@@ -369,7 +462,7 @@ export function PlayCoach() {
                   {feedback.classification === 'inaccuracy' ? 'Slightly inaccurate. '
                     : feedback.classification === 'mistake' ? 'A mistake. '
                     : 'A blunder. '}
-                  The engine prefers <span className="font-mono text-slate-200">{feedback.bestSan}</span>.
+                  The engine prefers <span className="font-mono text--slate-200">{feedback.bestSan}</span>.
                 </p>
               )}
               {feedback.bestPv && feedback.bestPv.length > 0 && (
@@ -382,7 +475,7 @@ export function PlayCoach() {
 
           <div className="rounded-xl border border-ink-600 bg-ink-800 p-3">
             <h2 className="text-xs uppercase tracking-wide text-slate-500 mb-2">Moves</h2>
-            <div className="max-h-64 overflow-y-auto text-sm font-mono">
+            <div className="max-h64 overflow-y-auto text-sm font-mono">
               {turns.length === 0 && <p className="text-slate-500 font-sans">Waiting...</p>}
               <div className="grid grid-cols-[2.5rem_1fr_1fr] gap-x-2">
                 {chunkPairs(turns).map(([w, b], i) => (

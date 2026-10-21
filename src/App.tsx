@@ -21,10 +21,10 @@ const ROUTES: Record<string, ComponentType> = {
 };
 
 export default function App() {
-  const [route, setRoute] = useState(() => location.hash.slice(1) || 'dashboard');
+  const [route, setRoute] = useState(() => location.hash.slice(1).split("?")[0] || 'dashboard');
 
   useEffect(() => {
-    const onHash = () => setRoute(location.hash.slice(1) || 'dashboard');
+    const onHash = () => setRoute(location.hash.slice(1).split("?")[0] || 'dashboard');
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);

@@ -5,6 +5,7 @@ import { ChevronFirst, ChevronLeft, ChevronRight, ChevronLast, Play, Square, Upl
 import { parsePgn, isValidFen, fenAtPly, PgnError } from '../lib/pgn';
 import { getEngine } from '../engine/stockfish';
 import { useEngine } from '../hooks/useEngine';
+import { useLoadGameFromHash } from '../hooks/useLoadGameFromHash';
 import { runAnalysis } from '../features-runner';
 import { saveGame, saveAnalysis, addTrainingItem, makeTrainingItem, getAnalysis, getPrefs } from '../storage/db';
 import { openingFor } from '../lib/openings';
@@ -24,6 +25,26 @@ export function Analysis() {
   const [liveEval, setLiveEval] = useState<{ cp: number | null; mate: number | null }>({ cp: null, mate: null });
   const abortRef = useRef<AbortController | null>(null);
   const partialRef = useRef<MoveEval[]>([]);
+
+  // Load a specific game if the URL hash has ?gameId= (from PlayCoach).
+  // Bypasses parsePgn/importPgn so we keep the existing record id.
+  useLoadGameFromHash((g) => {
+    setPgnText(g.pgn);
+    setGame(g);
+    setPly(0);
+    setPartial([]);
+    partialRef.current = [];
+    setMsg(`Loaded game (${g.plies} half-moves).`);
+    void (async () => {
+      try {
+        const existing = await getAnalysis(g.id);
+        if (existing) {
+          setPartial(existing.moves);
+          partialRef.current = existing.moves;
+        }
+      } catch { /* ignore */ }
+    })();
+  });
 
   useEffect(() => {
     const m = partial.find((x) => x.ply === ply);

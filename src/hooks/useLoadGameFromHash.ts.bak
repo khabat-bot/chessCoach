@@ -1,0 +1,38 @@
+import { useEffect, useRef } from 'react';
+import { listGames } from '../storage/db';
+import type { GameRecord } from '../types';
+
+/**
+ * One-shot loader: if the URL hash contains ?gameId=<id>, load that game
+ * from IndexedDB and hand it to onLoad. Fires at most once per mount.
+ *
+ * Used by Analysis.tsx so "Save & Analyse" from PlayCoach opens the
+ * record that was just played, without creating a duplicate.
+ */
+export function useLoadGameFromHash(onLoad: (g: GameRecord) => void) {
+  const onLoadRef = useRef(onLoad);
+  onLoadRef.current = onLoad;
+  const firedRef = useRef(false);
+
+  useEffect(() => {
+    if (firedRef.current) return;
+    const m = window.location.hash.match(/[?&]gameId=([^&]+)/);
+    if (!m) return;
+    firedRef.current = true;
+    const id = decodeURIComponent(m[1]);
+    let cancelled = false;
+    void (async () => {
+      try {
+        const games = await listGames();
+        const g = games.find((x) => x.id === id);
+        if (!cancelled && g) onLoadRef.current(g);
+      } catch {
+        /* silently ignore — normal PGN flow still works */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+}
