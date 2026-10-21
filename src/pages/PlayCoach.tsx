@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Chessboard } from 'react-chessboard';
 import { Chess } from 'chess.js';
+import { Volume2 } from 'lucide-react';
 import { useEngine } from '../hooks/useEngine';
 import { getEngine } from '../engine/stockfish';
 import { classify, evalLoss, toCentipawns } from '../lib/eval';
@@ -13,7 +14,7 @@ import {
   coachLine, openingLine, opponentComment,
   type CoachLine,
 } from '../lib/coachVoice';
-import { speak, stopSpeaking, isTTSEnabled } from '../lib/coachTTS';
+import { speak, stopSpeaking, isTTSEnabled, isIOS } from '../lib/coachTTS';
 
 interface Turn {
   ply: number;
@@ -40,8 +41,8 @@ interface BeforeCache {
 }
 
 interface EvalDisplay {
-  cp: number | null;   // White POV
-  mate: number | null; // White POV, positive = White mates
+  cp: number | null;
+  mate: number | null;
 }
 
 const DIFFICULTIES = [
@@ -68,7 +69,6 @@ function uciToSan(fen: string, uci: string | null | undefined): string | null {
   } catch { return null; }
 }
 
-// Convert a side-to-move-POV eval to White POV, given which side was to move.
 function toWhitePov(cp: number | null, sideToMove: 'w' | 'b'): number | null {
   if (cp === null) return null;
   return sideToMove === 'w' ? cp : -cp;
@@ -107,9 +107,16 @@ export function PlayCoach() {
   const initCacheRef = useRef(false);
   const savedRef = useRef(false);
 
+  // Speak automatically on desktop. On iOS this is a no-op for feedback —
+  // the tap-to-hear button next to the feedback handles it there.
+  function autoSpeak(line: CoachLine | null) {
+    if (!line || !isTTSEnabled()) return;
+    if (isIOS()) return;
+    speak(line.text, line.mood);
+  }
+
   useEffect(() => () => stopSpeaking(), []);
 
-  // Init eval for the starting position (White to move → White POV = side-to-move POV).
   useEffect(() => {
     if (status !== 'ready' || initCacheRef.current) return;
     if (userColorRef.current !== 'w') return;
@@ -208,14 +215,11 @@ export function PlayCoach() {
       const coachRes = await engine.evaluate(fenAfterEngine, COACH_DEPTH, ctrl.signal);
       const cp = toCentipawns(coachRes.raw);
 
-      // Side to move here is the USER (engine just moved), so cp is USER POV.
-      // Cache it — the loss calculation next turn needs user POV.
       cachedBeforeRef.current = {
         cp,
         bestSan: uciToSan(fenAfterEngine, coachRes.pv[0] ?? coachRes.bestMove ?? null)
       };
 
-      // Convert to White POV for the eval bar.
       const cpWhite = toWhitePov(cp, userColorRef.current);
       const mateWhite = mateToWhitePov(coachRes.mate ?? null, userColorRef.current);
 
@@ -290,7 +294,6 @@ export function PlayCoach() {
       const isBest = bestSan !== undefined && mv.san === bestSan;
       const classification = classify(loss, isBest);
 
-      // Side to move now = OPPONENT of user. afterCpOpp is opponent POV.
       const opponentColor: 'w' | 'b' = userColorRef.current === 'w' ? 'b' : 'w';
       const afterCpWhite = toWhitePov(afterCpOpp, opponentColor);
       const afterMateWhite = mateToWhitePov(coachRes.mate ?? null, opponentColor);
@@ -332,6 +335,7 @@ export function PlayCoach() {
         moveCount: userTurns,
       });
       setCoach(line);
+      autoSpeak(line);
 
       if (!c.isGameOver()) {
         await playEngineMove(c);
@@ -364,6 +368,7 @@ export function PlayCoach() {
     setCurrentEval({ cp: null, mate: null });
     const greet = openingLine();
     setCoach(greet);
+    // Greeting is spoken from inside the click — works on every platform.
     if (isTTSEnabled()) speak(greet.text, greet.mood);
     resetSaved();
     cachedBeforeRef.current = { cp: null, bestSan: null };
@@ -436,6 +441,10 @@ export function PlayCoach() {
 
   const boardOrientation = userColor === 'w' ? 'white' : 'black';
   const gameOver = game.isGameOver();
+
+  function hearFeedback() {
+    if (coach && isTTSEnabled()) speak(coach.text, coach.mood);
+  }
 
   return (
     <div className="max-w-6xl space-y-4">
@@ -515,7 +524,6 @@ export function PlayCoach() {
             {saveMsg && <p className="text-xs text-amber-300">{saveMsg}</p>}
             <p className="text-xs text-slate-500">
               Coaching depth is {COACH_DEPTH}. Finished games are saved automatically.
-              Voice plays when you start a new game.
             </p>
           </div>
 
@@ -535,6 +543,17 @@ export function PlayCoach() {
                 )}
                 {feedback.bestSan && feedback.classification !== 'best' && (
                   <span>· engine's pick: <span className="font-mono text-slate-300">{feedback.bestSan}</span></span>
+                )}
+                {coach && (
+                  <button
+                    type="button"
+                    onClick={hearFeedback}
+                    title="Hear this feedback"
+                    aria-label="Hear this feedback"
+                    className="ml-auto rounded p-1 text-slate-400 hover:bg-slate-500/20 hover:text-slate-200 transition-colors"
+                  >
+                    <Volume2 className="h-3.5 w-3.5" />
+                  </button>
                 )}
               </div>
               {feedback.bestPv && feedback.bestPv.length > 0 && (

@@ -1,9 +1,4 @@
 // src/lib/coachTTS.ts
-//
-// Minimal speech wrapper. Speech only fires when the caller invokes speak()
-// from inside a real user gesture (e.g. a click handler). That is the only
-// reliable path on iOS Safari and it works everywhere else too.
-
 export type TTSMood = 'happy' | 'excited' | 'neutral' | 'concerned' | 'sad';
 
 const KEY = 'chess-supercoach:tts';
@@ -29,6 +24,12 @@ export function setTTSEnabled(v: boolean): void {
 export function onTTSChange(fn: (v: boolean) => void): () => void {
   listeners.add(fn);
   return () => { listeners.delete(fn); };
+}
+
+export function isIOS(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 }
 
 function synth(): SpeechSynthesis | null {
@@ -57,11 +58,6 @@ function pickVoice(): SpeechSynthesisVoice | null {
   return voices.find(v => v.lang.startsWith('en')) ?? voices[0];
 }
 
-/**
- * Speak. Call from inside a click handler for guaranteed playback.
- * If nothing happens on iOS Safari, it's because the device is on silent
- * mode (physical side switch), or the browser is missing a voice.
- */
 export function speak(text: string, mood: TTSMood = 'neutral'): void {
   const s = synth();
   if (!s || !text) return;
