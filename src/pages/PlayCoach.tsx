@@ -8,6 +8,12 @@ import { parsePgn } from '../lib/pgn';
 import { saveGame } from '../storage/db';
 import type { Classification } from '../types';
 import { EvalBar } from '../components/EvalBar';
+import { CoachBubble } from '../components/CoachBubble';
+import {
+  coachLine, openingLine, opponentComment,
+  type CoachLine,
+} from '../lib/coachVoice';
+import { speak, stopSpeaking, isTTSEnabled } from '../lib/coachTTS';
 
 interface Turn {
   ply: number;
@@ -28,6 +34,16 @@ interface CoachFeedback {
   bestPv?: string[];
 }
 
+interface BeforeCache {
+  cp: number | null;
+  bestSan: string | null;
+}
+
+interface EvalDisplay {
+  cp: number | null;   // White POV
+  mate: number | null; // White POV, positive = White mates
+}
+
 const DIFFICULTIES = [
   { label: 'Beginner', playDepth: 2 },
   { label: 'Easy', playDepth: 3 },
@@ -39,6 +55,29 @@ const DIFFICULTIES = [
 const COACH_DEPTH = 10;
 const UCI_MOVE = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 
+function uciToSan(fen: string, uci: string | null | undefined): string | null {
+  if (!uci || !UCI_MOVE.test(uci)) return null;
+  try {
+    const g = new Chess(fen);
+    const m = g.move({
+      from: uci.slice(0, 2),
+      to: uci.slice(2, 4),
+      promotion: uci.slice(4, 5) || undefined
+    });
+    return m?.san ?? null;
+  } catch { return null; }
+}
+
+// Convert a side-to-move-POV eval to White POV, given which side was to move.
+function toWhitePov(cp: number | null, sideToMove: 'w' | 'b'): number | null {
+  if (cp === null) return null;
+  return sideToMove === 'w' ? cp : -cp;
+}
+function mateToWhitePov(mate: number | null, sideToMove: 'w' | 'b'): number | null {
+  if (mate === null) return null;
+  return sideToMove === 'w' ? mate : -mate;
+}
+
 export function PlayCoach() {
   const { status, error } = useEngine();
   const engine = getEngine();
@@ -49,6 +88,9 @@ export function PlayCoach() {
   const [thinking, setThinking] = useState<string | null>(null);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [feedback, setFeedback] = useState<CoachFeedback | null>(null);
+  const [coach, setCoach] = useState<CoachLine | null>(openingLine());
+  const [aside, setAside] = useState<string | null>(null);
+  const [currentEval, setCurrentEval] = useState<EvalDisplay>({ cp: null, mate: null });
   const [engineError, setEngineError] = useState<string | null>(null);
   const [savedGameId, setSavedGameId] = useState<string | null>(null);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
@@ -60,24 +102,35 @@ export function PlayCoach() {
   const difficultyRef = useRef(difficulty);
   difficultyRef.current = difficulty;
 
-  const cachedBeforeEvalRef = useRef<number | null>(null);
+  const cachedBeforeRef = useRef<BeforeCache>({ cp: null, bestSan: null });
   const abortRef = useRef<AbortController | null>(null);
   const initCacheRef = useRef(false);
   const savedRef = useRef(false);
 
+  useEffect(() => () => stopSpeaking(), []);
+
+  // Init eval for the starting position (White to move → White POV = side-to-move POV).
   useEffect(() => {
     if (status !== 'ready' || initCacheRef.current) return;
     if (userColorRef.current !== 'w') return;
     initCacheRef.current = true;
     void (async () => {
       try {
-        const res = await engine.evaluate(gameRef.current.fen(), COACH_DEPTH);
-        cachedBeforeEvalRef.current = toCentipawns(res.raw);
+        const fen = gameRef.current.fen();
+        const res = await engine.evaluate(fen, COACH_DEPTH);
+        const cp = toCentipawns(res.raw);
+        cachedBeforeRef.current = {
+          cp,
+          bestSan: uciToSan(fen, res.pv[0] ?? res.bestMove ?? null)
+        };
+        setCurrentEval({
+          cp: toWhitePov(cp, 'w'),
+          mate: mateToWhitePov(res.mate ?? null, 'w')
+        });
       } catch { /* ignore */ }
     })();
   }, [status, engine]);
 
-  // Auto-save when the game ends. Fires on every ply, cheap no-op otherwise.
   useEffect(() => {
     if (!savedRef.current && gameRef.current.isGameOver()) {
       void persistGame();
@@ -86,64 +139,46 @@ export function PlayCoach() {
   }, [turns]);
 
   async function persistGame(): Promise<string | null> {
-  if (savedRef.current) return savedGameId;
-  if (turns.length === 0) return null;
+    if (savedRef.current) return savedGameId;
+    if (turns.length === 0) return null;
 
-  // gameRef.current is recreated from FEN on every ply, so its pgn() only
-  // holds the LAST move. Rebuild the full game from `turns` (all SANs, in
-  // order) starting from the standard initial position.
-  const rebuilt = new Chess();
-  for (const t of turns) {
+    const rebuilt = new Chess();
+    for (const t of turns) {
+      try { rebuilt.move(t.san); }
+      catch { setEngineError(`Could not replay move ${t.ply}: ${t.san}`); return null; }
+    }
+    if (rebuilt.history().length === 0) return null;
+
+    const plies = rebuilt.history().length;
+    const result = rebuilt.isCheckmate()
+      ? (rebuilt.turn() === 'w' ? '0-1' : '1-0')
+      : rebuilt.isDraw() ? '1/2-1/2' : '*';
+
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '.');
+    rebuilt.header(
+      'Event', 'Coaching game', 'Site', 'chess-supercoach', 'Date', today,
+      'White', 'You', 'Black', 'Coach', 'Result', result, 'PlyCount', String(plies)
+    );
+
+    const pgn = rebuilt.pgn();
+    if (!pgn || !pgn.trim()) return null;
+
     try {
-      rebuilt.move(t.san);
-    } catch {
-      setEngineError(`Could not replay move ${t.ply}: ${t.san}`);
+      const rec = parsePgn(pgn);
+      await saveGame(rec);
+      savedRef.current = true;
+      setSavedGameId(rec.id);
+      return rec.id;
+    } catch (e) {
+      setEngineError((e as Error).message);
       return null;
     }
   }
-  if (rebuilt.history().length === 0) return null;
 
-  const plies = rebuilt.history().length;
-  const result = rebuilt.isCheckmate()
-    ? (rebuilt.turn() === 'w' ? '0-1' : '1-0')
-    : rebuilt.isDraw() ? '1/2-1/2' : '*';
-
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '.');
-  // Use chess.js's own header writer — do NOT wrap .pgn() in our own
-  // header block (that produces two [Event "?"] tags and the inner
-  // [Result "*"] wins).
-  rebuilt.header(
-    'Event', 'Coaching game',
-    'Site', 'chess-supercoach',
-    'Date', today,
-    'White', 'You',
-    'Black', 'Coach',
-    'Result', result,
-    'PlyCount', String(plies)
-  );
-
-  const pgn = rebuilt.pgn();
-  if (!pgn || !pgn.trim()) return null;
-
-  try {
-    const rec = parsePgn(pgn);
-    await saveGame(rec);
-    savedRef.current = true;
-    setSavedGameId(rec.id);
-    return rec.id;
-  } catch (e) {
-    setEngineError((e as Error).message);
-    return null;
-  }
-}
-
-async function saveAndAnalyze() {
+  async function saveAndAnalyze() {
     setSaveMsg(null);
     const id = savedRef.current ? savedGameId : await persistGame();
-    if (!id) {
-      setSaveMsg('Nothing to save yet — play at least one move.');
-      return;
-    }
+    if (!id) { setSaveMsg('Nothing to save yet — play at least one move.'); return; }
     window.location.hash = `#analysis?gameId=${encodeURIComponent(id)}`;
   }
 
@@ -154,12 +189,13 @@ async function saveAndAnalyze() {
     try {
       const idx = Math.max(0, Math.min(DIFFICULTIES.length - 1, difficultyRef.current));
       const playDepth = DIFFICULTIES[idx].playDepth;
+      const fenBeforeEngine = c.fen();
 
-      const res = await engine.evaluate(c.fen(), playDepth, ctrl.signal);
+      const res = await engine.evaluate(fenBeforeEngine, playDepth, ctrl.signal);
       const uci = res.bestMove;
       if (!uci || !UCI_MOVE.test(uci)) return;
 
-      const c2 = new Chess(c.fen());
+      const c2 = new Chess(fenBeforeEngine);
       const played = c2.move({
         from: uci.slice(0, 2),
         to: uci.slice(2, 4),
@@ -168,12 +204,22 @@ async function saveAndAnalyze() {
       if (!played) return;
 
       setThinking('Updating evaluation...');
-      const coachRes = await engine.evaluate(c2.fen(), COACH_DEPTH, ctrl.signal);
+      const fenAfterEngine = c2.fen();
+      const coachRes = await engine.evaluate(fenAfterEngine, COACH_DEPTH, ctrl.signal);
       const cp = toCentipawns(coachRes.raw);
-      cachedBeforeEvalRef.current = cp;
 
-      const engineColor = userColorRef.current === 'w' ? 'b' : 'w';
-      const cpWhite = cp === null ? null : (engineColor === 'w' ? cp : -cp);
+      // Side to move here is the USER (engine just moved), so cp is USER POV.
+      // Cache it — the loss calculation next turn needs user POV.
+      cachedBeforeRef.current = {
+        cp,
+        bestSan: uciToSan(fenAfterEngine, coachRes.pv[0] ?? coachRes.bestMove ?? null)
+      };
+
+      // Convert to White POV for the eval bar.
+      const cpWhite = toWhitePov(cp, userColorRef.current);
+      const mateWhite = mateToWhitePov(coachRes.mate ?? null, userColorRef.current);
+
+      setCurrentEval({ cp: cpWhite, mate: mateWhite });
 
       setTurns((prev) => [...prev, {
         ply: c2.history().length,
@@ -185,6 +231,14 @@ async function saveAndAnalyze() {
       }]);
 
       setGame(c2);
+
+      const note = opponentComment({
+        san: played.san,
+        fenBefore: fenBeforeEngine,
+        fenAfter: fenAfterEngine,
+        userColor: userColorRef.current,
+      });
+      setAside(note);
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setEngineError((e as Error).message);
     } finally {
@@ -193,54 +247,58 @@ async function saveAndAnalyze() {
     }
   }
 
-  async function onPieceDrop(from: string, to: string): Promise<boolean> {
+  function onPieceDrop(from: string, to: string): boolean {
     if (thinking || status !== 'ready') return false;
     if (gameRef.current.turn() !== userColorRef.current) return false;
     if (gameRef.current.isGameOver()) return false;
-
-    const c = new Chess(gameRef.current.fen());
-    let mv;
     try {
-      mv = c.move({ from, to, promotion: 'q' });
+      const probe = new Chess(gameRef.current.fen());
+      if (!probe.move({ from, to, promotion: 'q' })) return false;
     } catch {
       return false;
     }
+    void executeUserMove(from, to);
+    return true;
+  }
+
+  async function executeUserMove(from: string, to: string): Promise<boolean> {
+    const fenBefore = gameRef.current.fen();
+    const c = new Chess(fenBefore);
+    let mv;
+    try { mv = c.move({ from, to, promotion: 'q' }); }
+    catch { return false; }
     if (!mv) return false;
 
     setGame(c);
     setFeedback(null);
+    setAside(null);
     setThinking('Analysing your move...');
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
     try {
-      const beforeUserPov = cachedBeforeEvalRef.current;
+      const cached = cachedBeforeRef.current;
+      const beforeUserPov = cached.cp;
+      const bestSan = cached.bestSan ?? undefined;
 
       const coachRes = await engine.evaluate(c.fen(), COACH_DEPTH, ctrl.signal);
       const afterCpOpp = toCentipawns(coachRes.raw);
       const afterCpUserPov = afterCpOpp === null ? null : -afterCpOpp;
       const loss = evalLoss(beforeUserPov, afterCpUserPov);
 
-      const trueBestUci = coachRes.pv[0] ?? '';
-      let bestSan: string | undefined;
-      if (UCI_MOVE.test(trueBestUci)) {
-        const probe = new Chess(gameRef.current.fen());
-        try {
-          const bm = probe.move({
-            from: trueBestUci.slice(0, 2),
-            to: trueBestUci.slice(2, 4),
-            promotion: trueBestUci.slice(4, 5) || undefined
-          });
-          bestSan = bm?.san;
-        } catch { /* ignore */ }
-      }
-
-      const isBest = mv.san === bestSan;
+      const isBest = bestSan !== undefined && mv.san === bestSan;
       const classification = classify(loss, isBest);
 
-      const engineColor = userColorRef.current === 'w' ? 'b' : 'w';
-      const afterCpWhite = afterCpOpp === null ? null : (engineColor === 'w' ? afterCpOpp : -afterCpOpp);
+      // Side to move now = OPPONENT of user. afterCpOpp is opponent POV.
+      const opponentColor: 'w' | 'b' = userColorRef.current === 'w' ? 'b' : 'w';
+      const afterCpWhite = toWhitePov(afterCpOpp, opponentColor);
+      const afterMateWhite = mateToWhitePov(coachRes.mate ?? null, opponentColor);
+
+      setCurrentEval({ cp: afterCpWhite, mate: afterMateWhite });
+
+      const userTurns = turns.filter(t => t.isUser).length + 1;
+      const lastOpponentSan = [...turns].reverse().find(t => !t.isUser)?.san;
 
       setTurns((prev) => [...prev, {
         ply: c.history().length,
@@ -255,6 +313,26 @@ async function saveAndAnalyze() {
 
       setFeedback({ classification, san: mv.san, loss, bestSan, bestPv: coachRes.pv });
 
+      const isCheckmate = c.isCheckmate();
+      const userWon = isCheckmate && c.turn() !== userColorRef.current;
+      const line = coachLine({
+        classification,
+        playedSan: mv.san,
+        bestSan: bestSan ?? '',
+        lossCp: loss ?? 0,
+        fenBefore,
+        fenAfter: c.fen(),
+        bestPv: coachRes.pv ?? [],
+        evalForUserCp: afterCpUserPov ?? undefined,
+        isGameOver: c.isGameOver(),
+        isCheckmate,
+        isDraw: c.isDraw(),
+        userWon,
+        lastOpponentSan,
+        moveCount: userTurns,
+      });
+      setCoach(line);
+
       if (!c.isGameOver()) {
         await playEngineMove(c);
       }
@@ -264,7 +342,6 @@ async function saveAndAnalyze() {
       setThinking(null);
       abortRef.current = null;
     }
-
     return true;
   }
 
@@ -276,14 +353,20 @@ async function saveAndAnalyze() {
 
   function newGame() {
     abortRef.current?.abort();
+    stopSpeaking();
     const c = new Chess();
     setGame(c);
     setTurns([]);
     setFeedback(null);
+    setAside(null);
     setThinking(null);
     setEngineError(null);
+    setCurrentEval({ cp: null, mate: null });
+    const greet = openingLine();
+    setCoach(greet);
+    if (isTTSEnabled()) speak(greet.text, greet.mood);
     resetSaved();
-    cachedBeforeEvalRef.current = null;
+    cachedBeforeRef.current = { cp: null, bestSan: null };
     initCacheRef.current = false;
 
     if (status === 'ready') {
@@ -293,8 +376,17 @@ async function saveAndAnalyze() {
         initCacheRef.current = true;
         void (async () => {
           try {
-            const res = await engine.evaluate(c.fen(), COACH_DEPTH);
-            cachedBeforeEvalRef.current = toCentipawns(res.raw);
+            const fen = c.fen();
+            const res = await engine.evaluate(fen, COACH_DEPTH);
+            const cp = toCentipawns(res.raw);
+            cachedBeforeRef.current = {
+              cp,
+              bestSan: uciToSan(fen, res.pv[0] ?? res.bestMove ?? null)
+            };
+            setCurrentEval({
+              cp: toWhitePov(cp, 'w'),
+              mate: mateToWhitePov(res.mate ?? null, 'w')
+            });
           } catch { /* ignore */ }
         })();
       }
@@ -304,14 +396,18 @@ async function saveAndAnalyze() {
   function changeColor(color: 'w' | 'b') {
     setUserColor(color);
     userColorRef.current = color;
+    stopSpeaking();
     const c = new Chess();
     setGame(c);
     setTurns([]);
     setFeedback(null);
+    setAside(null);
     setThinking(null);
     setEngineError(null);
+    setCurrentEval({ cp: null, mate: null });
+    setCoach(openingLine());
     resetSaved();
-    cachedBeforeEvalRef.current = null;
+    cachedBeforeRef.current = { cp: null, bestSan: null };
     initCacheRef.current = false;
 
     if (status === 'ready') {
@@ -321,8 +417,17 @@ async function saveAndAnalyze() {
         initCacheRef.current = true;
         void (async () => {
           try {
-            const res = await engine.evaluate(c.fen(), COACH_DEPTH);
-            cachedBeforeEvalRef.current = toCentipawns(res.raw);
+            const fen = c.fen();
+            const res = await engine.evaluate(fen, COACH_DEPTH);
+            const cp = toCentipawns(res.raw);
+            cachedBeforeRef.current = {
+              cp,
+              bestSan: uciToSan(fen, res.pv[0] ?? res.bestMove ?? null)
+            };
+            setCurrentEval({
+              cp: toWhitePov(cp, 'w'),
+              mate: mateToWhitePov(res.mate ?? null, 'w')
+            });
           } catch { /* ignore */ }
         })();
       }
@@ -330,7 +435,6 @@ async function saveAndAnalyze() {
   }
 
   const boardOrientation = userColor === 'w' ? 'white' : 'black';
-  const lastEval = turns.length ? turns[turns.length - 1].evalWhitePov : null;
   const gameOver = game.isGameOver();
 
   return (
@@ -339,8 +443,7 @@ async function saveAndAnalyze() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Play the coach</h1>
           <p className="text-sm text-slate-400 mt-1">
-            Play against Stockfish. After each of your moves, the coach checks whether you followed
-            the engine's top choice and shows what you should have played.
+            Play against Stockfish. Your coach watches every move and talks you through it.
           </p>
         </div>
         <span className={`text-xs px-2 py-1 rounded-full ${
@@ -359,7 +462,7 @@ async function saveAndAnalyze() {
 
       <div className="grid lg:grid-cols-[auto_1fr] gap-4">
         <div className="flex gap-3">
-          <EvalBar cp={lastEval} mate={null} />
+          <EvalBar cp={currentEval.cp} mate={currentEval.mate} />
           <div className="w-[min(78vw,480px)]">
             <Chessboard
               position={game.fen()}
@@ -411,10 +514,36 @@ async function saveAndAnalyze() {
             </div>
             {saveMsg && <p className="text-xs text-amber-300">{saveMsg}</p>}
             <p className="text-xs text-slate-500">
-              Coaching depth is {COACH_DEPTH} for accurate feedback. Difficulty only changes how
-              strongly Stockfish plays its own moves. Finished games are saved automatically.
+              Coaching depth is {COACH_DEPTH}. Finished games are saved automatically.
+              Voice plays when you start a new game.
             </p>
           </div>
+
+          <CoachBubble
+            line={thinking ? null : coach}
+            thinking={!!thinking}
+            aside={thinking ? null : aside}
+          />
+
+          {feedback && !thinking && (
+            <div className="space-y-1 px-2">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <Badge cls={feedback.classification} />
+                <span className="font-mono text-slate-300">{feedback.san}</span>
+                {feedback.loss !== null && feedback.loss > 0 && (
+                  <span>−{(feedback.loss / 100).toFixed(2)} pawns</span>
+                )}
+                {feedback.bestSan && feedback.classification !== 'best' && (
+                  <span>· engine's pick: <span className="font-mono text-slate-300">{feedback.bestSan}</span></span>
+                )}
+              </div>
+              {feedback.bestPv && feedback.bestPv.length > 0 && (
+                <div className="text-xs font-mono text-slate-500 break-words">
+                  Engine line: {feedback.bestPv.slice(0, 8).join(' ')}
+                </div>
+              )}
+            </div>
+          )}
 
           {gameOver && (
             <div className="rounded-xl border border-lime/40 bg-lime/10 p-3 text-sm">
@@ -428,54 +557,9 @@ async function saveAndAnalyze() {
             </div>
           )}
 
-          {thinking && (
-            <div className="rounded-xl border border-ink-600 bg-ink-800 p-3 text-sm text-slate-400">
-              {thinking}
-            </div>
-          )}
-
-          {feedback && (
-            <div className={`rounded-xl border p-4 text-sm space-y-2 ${
-              feedback.classification === 'blunder' ? 'border-rose-500/40 bg-rose-500/10'
-              : feedback.classification === 'mistake' ? 'border-orange-500/40 bg-orange-500/10'
-              : feedback.classification === 'inaccuracy' ? 'border-amber-400/40 bg-amber-400/10'
-              : feedback.classification === 'best' ? 'border-lime/40 bg-lime/10'
-              : 'border-ink-600 bg-ink-800'
-            }`}>
-              <div className="flex items-center gap-2">
-                <Badge cls={feedback.classification} />
-                <span className="font-medium font-mono">{feedback.san}</span>
-                {feedback.loss !== null && feedback.loss > 0 && (
-                  <span className="text-xs text-slate-400">
-                    -{(feedback.loss / 100).toFixed(2)} pawns
-                  </span>
-                )}
-              </div>
-              {feedback.classification === 'best' && (
-                <p>That is the engine's top choice.</p>
-              )}
-              {feedback.classification === 'good' && (
-                <p>Solid move. The engine slightly prefers {feedback.bestSan ?? 'a different line'}.</p>
-              )}
-              {['inaccuracy', 'mistake', 'blunder'].includes(feedback.classification) && feedback.bestSan && (
-                <p>
-                  {feedback.classification === 'inaccuracy' ? 'Slightly inaccurate. '
-                    : feedback.classification === 'mistake' ? 'A mistake. '
-                    : 'A blunder. '}
-                  The engine prefers <span className="font-mono text--slate-200">{feedback.bestSan}</span>.
-                </p>
-              )}
-              {feedback.bestPv && feedback.bestPv.length > 0 && (
-                <div className="text-xs font-mono text-slate-500 break-words">
-                  PV: {feedback.bestPv.slice(0, 8).join(' ')}
-                </div>
-              )}
-            </div>
-          )}
-
           <div className="rounded-xl border border-ink-600 bg-ink-800 p-3">
             <h2 className="text-xs uppercase tracking-wide text-slate-500 mb-2">Moves</h2>
-            <div className="max-h64 overflow-y-auto text-sm font-mono">
+            <div className="max-h-64 overflow-y-auto text-sm font-mono">
               {turns.length === 0 && <p className="text-slate-500 font-sans">Waiting...</p>}
               <div className="grid grid-cols-[2.5rem_1fr_1fr] gap-x-2">
                 {chunkPairs(turns).map(([w, b], i) => (
